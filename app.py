@@ -66,13 +66,17 @@ def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
     return r_miles * c
 
 
-def _geocode_nominatim(address: str) -> tuple[float, float, Optional[str]]:
+def _geocode_nominatim(address: str, *, contact_email: str) -> tuple[float, float, Optional[str]]:
     """
     Geocode address with OpenStreetMap Nominatim.
     Returns: (lat, lon, postcode)
     """
     url = "https://nominatim.openstreetmap.org/search"
-    headers = {"User-Agent": "IDX-Streamlit-App/1.0 (mailto:example@example.com)"}
+    # Nominatim requires a descriptive User-Agent with a contact email (per their usage policy).
+    contact_email = (contact_email or "").strip()
+    if not contact_email:
+        contact_email = "noreply@idx.local"
+    headers = {"User-Agent": f"IDX-Streamlit-App/1.0 (mailto:{contact_email})"}
     params = {"q": address, "format": "json", "limit": 1, "addressdetails": 1}
     resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
@@ -88,6 +92,58 @@ def _geocode_nominatim(address: str) -> tuple[float, float, Optional[str]]:
     if "address" in item and isinstance(item["address"], dict):
         postcode = _normalize_zip(item["address"].get("postcode"))
     # Fallback: sometimes postcode is embedded in display_name; we skip that.
+    return lat, lon, postcode
+
+
+def _geocode_maps_co(address: str) -> tuple[float, float, Optional[str]]:
+    """
+    Alternative geocoder using https://geocode.maps.co/ (free; backed by OSM).
+    Returns: (lat, lon, postcode) when available.
+    """
+    url = "https://geocode.maps.co/search"
+    params = {"q": address, "limit": 1}
+    resp = requests.get(url, params=params, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        raise ValueError("No geocoding results found for that address.")
+    item = data[0]
+    lat = float(item["lat"])
+    lon = float(item["lon"])
+    postcode = None
+    if "address" in item and isinstance(item["address"], dict):
+        postcode = _normalize_zip(item["address"].get("postcode"))
+    # Some responses only include display_name; we don't parse it reliably here.
+    return lat, lon, postcode
+
+
+def _geocode_photon_komoot(address: str) -> tuple[float, float, Optional[str]]:
+    """
+    Geocode using Komoot Photon (no API key).
+    Endpoint: https://photon.komoot.io/api/
+    Returns: (lat, lon, postcode) when available.
+    """
+    url = "https://photon.komoot.io/api/"
+    params = {"q": address, "limit": 1}
+    headers = {"User-Agent": "IDX-Streamlit-App/1.0"}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    features = data.get("features") or []
+    if not features:
+        raise ValueError("No geocoding results found for that address.")
+
+    feature = features[0]
+    coords = feature.get("geometry", {}).get("coordinates")
+    # Photon returns [lon, lat]
+    if not coords or len(coords) < 2:
+        raise ValueError("Geocoding returned invalid coordinates.")
+    lon = float(coords[0])
+    lat = float(coords[1])
+
+    postcode = None
+    props = feature.get("properties") or {}
+    postcode = _normalize_zip(props.get("postcode"))
     return lat, lon, postcode
 
 
@@ -262,6 +318,7 @@ def main() -> None:
     st.caption("We’ll geocode your address to get Latitude/Longitude, then approximate ZIP encoding, district value, and nearest restaurant distance.")
 
     st.session_state.setdefault("address_query", "")
+    st.session_state.setdefault("contact_email", "")
     st.session_state.setdefault("latitude_input", 0.0)
     st.session_state.setdefault("longitude_input", 0.0)
     st.session_state.setdefault("postal_code_encoded_input", 0.0)
@@ -269,6 +326,8 @@ def main() -> None:
     st.session_state.setdefault("dist_nearest_restaurant_mi_input", 0.0)
 
     address = st.text_input("🏠 Enter property address", key="address_query", placeholder="e.g., 3938 Latrobe Street, Los Angeles, CA 90031")
+    st.caption("We use Komoot Photon for geocoding (no API key). Contact email is only used as a fallback for Nominatim.")
+    contact_email = st.text_input("📮 Contact email (fallback for Nominatim)", value="", key="contact_email")
 
     if st.button("🔎 Search & auto-fill", type="secondary"):
         if not address.strip():
@@ -277,7 +336,15 @@ def main() -> None:
             lookups = None
             with st.spinner("Geocoding + deriving features... (may take ~20-60s on first run)"):
                 try:
-                    lat, lon, postcode = _geocode_nominatim(address)
+                    # Prefer Komoot Photon (works without API key).
+                    try:
+                        lat, lon, postcode = _geocode_photon_komoot(address)
+                    except Exception:
+                        # Fallback chain (some environments may block one provider).
+                        try:
+                            lat, lon, postcode = _geocode_nominatim(address, contact_email=contact_email)
+                        except Exception:
+                            lat, lon, postcode = _geocode_maps_co(address)
                     st.session_state["latitude_input"] = lat
                     st.session_state["longitude_input"] = lon
 
