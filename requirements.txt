@@ -6,4 +6,4 @@ xgboost
 joblib
 pyarrow
 requests
-geopy
+
