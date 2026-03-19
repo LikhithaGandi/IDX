@@ -7,7 +7,7 @@ from typing import Optional, Dict, Any
 import numpy as np
 import pandas as pd
 import streamlit as st
-from geopy.geocoders import Nominatim
+import requests
 
 from model_utils import TARGET_COL, load_artifacts, predict_xgb
 from sklearn.neighbors import NearestNeighbors
@@ -65,23 +65,100 @@ def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> floa
     return r_miles * c
 
 
-def _geocode_geopy(address: str) -> tuple[float, float, Optional[str]]:
+def _get_google_maps_api_key() -> Optional[str]:
+    # Prefer Streamlit secrets, then environment variable.
+    try:
+        key = st.secrets.get("GOOGLE_MAPS_API_KEY")  # type: ignore[attr-defined]
+        if key:
+            return str(key).strip()
+    except Exception:
+        pass
+    key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+    return key or None
+
+
+def _geocode_google(address: str, api_key: str) -> tuple[float, float, Optional[str]]:
     """
-    Geocode address using geopy's Nominatim client.
-    Returns (lat, lon, postcode or None).
+    Google Geocoding API:
+    https://developers.google.com/maps/documentation/geocoding/overview
+    Returns (lat, lon, postcode_or_None).
     """
-    geolocator = Nominatim(user_agent="idx_streamlit_app")
-    location = geolocator.geocode(address, addressdetails=True, timeout=30)
-    if location is None:
-        raise ValueError("No geocoding results found for that address.")
-    lat = float(location.latitude)
-    lon = float(location.longitude)
+    url = "https://maps.googleapis.com/maps/api/geocode/json"
+    resp = requests.get(url, params={"address": address, "key": api_key}, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    status = data.get("status")
+    if status != "OK":
+        raise ValueError(f"Google geocoding failed: {status} {data.get('error_message','')}".strip())
+
+    result = data["results"][0]
+    loc = result["geometry"]["location"]
+    lat = float(loc["lat"])
+    lon = float(loc["lng"])
+
     postcode = None
-    raw = getattr(location, "raw", {}) or {}
-    address_dict = raw.get("address") or {}
-    if address_dict:
-        postcode = _normalize_zip(address_dict.get("postcode"))
+    for comp in result.get("address_components", []):
+        types = comp.get("types", [])
+        if "postal_code" in types:
+            postcode = _normalize_zip(comp.get("long_name"))
+            break
     return lat, lon, postcode
+
+
+def _nearest_restaurant_miles_google(lat: float, lon: float, api_key: str) -> Optional[float]:
+    """
+    Best-effort nearest restaurant distance using:
+    - Places Nearby Search (rankby=distance, type=restaurant)
+    - Distance Matrix (driving distance)
+    """
+    try:
+        places_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+        places_params = {
+            "location": f"{lat},{lon}",
+            "rankby": "distance",
+            "type": "restaurant",
+            "key": api_key,
+        }
+        r = requests.get(places_url, params=places_params, timeout=30)
+        r.raise_for_status()
+        pj = r.json()
+        if pj.get("status") not in ("OK", "ZERO_RESULTS"):
+            return None
+        results = pj.get("results") or []
+        if not results:
+            return None
+        dest = results[0].get("geometry", {}).get("location", {})
+        dlat = dest.get("lat")
+        dlng = dest.get("lng")
+        if dlat is None or dlng is None:
+            return None
+
+        dm_url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+        dm_params = {
+            "origins": f"{lat},{lon}",
+            "destinations": f"{float(dlat)},{float(dlng)}",
+            "mode": "driving",
+            "units": "imperial",
+            "key": api_key,
+        }
+        dmr = requests.get(dm_url, params=dm_params, timeout=30)
+        dmr.raise_for_status()
+        dmj = dmr.json()
+        if dmj.get("status") != "OK":
+            return None
+        elem = (dmj.get("rows") or [{}])[0].get("elements", [{}])[0]
+        if elem.get("status") != "OK":
+            return None
+        text = (elem.get("distance") or {}).get("text", "")
+        # "0.8 mi" or "1,234 ft"
+        if "mi" in text:
+            return float(text.replace("mi", "").replace(",", "").strip())
+        if "ft" in text:
+            feet = float(text.replace("ft", "").replace(",", "").strip())
+            return feet / 5280.0
+        return None
+    except Exception:
+        return None
 
 
 def _overpass_nearest_restaurant_miles(lat: float, lon: float) -> Optional[float]:
@@ -207,10 +284,10 @@ def main() -> None:
     st.caption("Fill these in and we’ll build the exact feature vector your model expects.")
 
     # ------------------------------
-    # Address auto-fill (web search)
+    # Address auto-fill (Google Maps)
     # ------------------------------
     st.markdown("## 🗺️ Address to auto-fill (optional)")
-    st.caption("We’ll geocode your address to get Latitude/Longitude, then approximate ZIP encoding, district value, and nearest restaurant distance.")
+    st.caption("We’ll use Google Maps to geocode your address (Latitude/Longitude + ZIP), then fill the remaining derived fields.")
 
     st.session_state.setdefault("address_query", "")
     st.session_state.setdefault("latitude_input", 0.0)
@@ -225,15 +302,18 @@ def main() -> None:
         placeholder="e.g., 3938 Latrobe Street, Los Angeles, CA 90031",
     )
 
-    if st.button("🔎 Search & auto-fill", type="secondary"):
+    google_key = _get_google_maps_api_key()
+    if google_key is None:
+        st.warning("🔑 Add `GOOGLE_MAPS_API_KEY` to Streamlit secrets (or env var) to enable address auto-fill.")
+
+    if st.button("🔎 Search & auto-fill", type="secondary", disabled=google_key is None):
         if not address.strip():
             st.warning("Type an address first 🙂")
         else:
             lookups = None
             with st.spinner("Geocoding + deriving features... (may take ~20-60s on first run)"):
                 try:
-                    # Single geocoder via geopy (Nominatim).
-                    lat, lon, postcode = _geocode_geopy(address)
+                    lat, lon, postcode = _geocode_google(address, google_key)  # type: ignore[arg-type]
                     st.session_state["latitude_input"] = lat
                     st.session_state["longitude_input"] = lon
 
@@ -257,7 +337,7 @@ def main() -> None:
 
                     # DistNearestRestaurantMi (approx via live OSM restaurants)
                     if "DistNearestRestaurantMi" in feature_columns:
-                        approx = _overpass_nearest_restaurant_miles(lat, lon)
+                        approx = _nearest_restaurant_miles_google(lat, lon, google_key)  # type: ignore[arg-type]
                         if approx is not None:
                             st.session_state["dist_nearest_restaurant_mi_input"] = float(approx)
 
