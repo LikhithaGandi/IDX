@@ -2,6 +2,7 @@ import os
 
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 from typing import Optional, Dict, Any
 
@@ -28,6 +29,45 @@ def _try_load_model(model_path: str) -> Optional[Dict[str, Any]]:
     return load_artifacts(model_path)
 
 
+def _geocode_address(address: str) -> Optional[Dict[str, Any]]:
+    """
+    Geocode an address into {latitude, longitude, postcode}.
+    Uses OpenStreetMap Nominatim (no API key required).
+    """
+    address = (address or "").strip()
+    if not address:
+        return None
+
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": address, "format": "json", "limit": 1}
+    headers = {"User-Agent": "streamlit-california-closeprice-predictor/1.0"}
+
+    resp = requests.get(url, params=params, headers=headers, timeout=15)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data:
+        return None
+
+    best = data[0]
+    lat = float(best["lat"])
+    lon = float(best["lon"])
+
+    postcode_raw = None
+    addr = best.get("address") or {}
+    if isinstance(addr, dict):
+        postcode_raw = addr.get("postcode")
+
+    postcode_val: float = 0.0
+    if postcode_raw:
+        # Keep digits only (e.g., "90031" -> 90031). Some locations may include dashes.
+        digits = "".join(ch for ch in str(postcode_raw) if ch.isdigit())
+        if digits:
+            # Most US zip codes are 5 digits.
+            postcode_val = float(digits[:5])
+
+    return {"latitude": lat, "longitude": lon, "postcode": postcode_val}
+
+
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
@@ -44,8 +84,31 @@ def main() -> None:
         st.error("`model.pkl` doesn't contain `feature_columns`. Re-train to generate compatible artifacts.")
         st.stop()
 
+    # Initialize defaults for the address auto-fill feature.
+    st.session_state.setdefault("latitude", 0.0)
+    st.session_state.setdefault("longitude", 0.0)
+    st.session_state.setdefault("postal_code_encoded", 0.0)
+
     st.subheader("🔎 Property details")
     st.caption("Fill these in and we’ll build the exact feature vector your model expects.")
+
+    st.divider()
+    st.subheader("🗺️ Address search (optional)")
+    addr_query = st.text_input("Enter an address (street, city, ZIP) and press Search 🔎", key="addr_query")
+    if st.button("Search address", type="secondary", use_container_width=False):
+        try:
+            result = _geocode_address(addr_query)
+            if not result:
+                st.warning("Could not geocode that address. Try a more specific address (including ZIP).")
+            else:
+                st.session_state["latitude"] = float(result["latitude"])
+                st.session_state["longitude"] = float(result["longitude"])
+                st.session_state["postal_code_encoded"] = float(result["postcode"])
+                st.success(
+                    f"Found it! 📍 Lat {result['latitude']:.5f}, Lon {result['longitude']:.5f}, ZIP {int(result['postcode'])}"
+                )
+        except Exception as e:
+            st.error(f"Geocoding failed: {e}")
 
     # Flooring selection drives multiple binary features: HasCarpet/HasVinyl/...
     flooring_map = {
@@ -85,8 +148,18 @@ def main() -> None:
             basement_yn = st.checkbox("🏠 Has Basement", value=False, disabled=not basement_flag)
             poolprivate_yn = st.checkbox("🏊 Private pool", value=False, disabled=not poolprivate_flag)
         with c2:
-            latitude = st.number_input("📍 Latitude", value=0.0, format="%.6f")
-            longitude = st.number_input("📍 Longitude", value=0.0, format="%.6f")
+            latitude = st.number_input(
+                "📍 Latitude",
+                value=float(st.session_state.get("latitude", 0.0)),
+                format="%.6f",
+                key="latitude",
+            )
+            longitude = st.number_input(
+                "📍 Longitude",
+                value=float(st.session_state.get("longitude", 0.0)),
+                format="%.6f",
+                key="longitude",
+            )
             living_area = st.number_input("📐 Living Area (sq ft)", value=0.0, min_value=0.0)
             days_on_market = st.number_input("⏳ Days on Market", value=0.0, min_value=0.0)
         with c3:
@@ -112,7 +185,11 @@ def main() -> None:
 
         st.markdown("### 🧠 Advanced (encoded/derived)")
         district_avg_price = st.number_input("📊 District average price", value=0.0)
-        postal_code_encoded = st.number_input("🏷️ Postal code (encoded)", value=0.0)
+        postal_code_encoded = st.number_input(
+            "🏷️ Postal code (encoded)",
+            value=float(st.session_state.get("postal_code_encoded", 0.0)),
+            key="postal_code_encoded",
+        )
         dist_nearest_restaurant_mi = st.number_input("🍽️ Distance to nearest restaurant (mi)", value=0.0)
 
         submitted = st.form_submit_button("Predict ClosePrice", type="primary")
