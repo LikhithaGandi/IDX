@@ -1,12 +1,17 @@
 import os
+import glob
+import math
+from collections import Counter
+from functools import lru_cache
+from typing import Optional, Dict, Any
+import requests
 
 import numpy as np
 import pandas as pd
-import requests
 import streamlit as st
-from typing import Optional, Dict, Any
 
 from model_utils import TARGET_COL, load_artifacts, predict_xgb
+from sklearn.neighbors import NearestNeighbors
 
 
 APP_TITLE = "California ClosePrice Predictor (XGBoost)"
@@ -29,44 +34,207 @@ def _try_load_model(model_path: str) -> Optional[Dict[str, Any]]:
     return load_artifacts(model_path)
 
 
-def _geocode_address(address: str) -> Optional[Dict[str, Any]]:
-    """
-    Geocode an address into {latitude, longitude, postcode}.
-    Uses OpenStreetMap Nominatim (no API key required).
-    """
-    address = (address or "").strip()
-    if not address:
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _normalize_zip(postcode: str) -> Optional[str]:
+    if postcode is None:
         return None
+    s = str(postcode).strip()
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if not digits:
+        return None
+    # Keep first 5 digits; pad if shorter (rare case).
+    digits = digits[:5]
+    return digits.zfill(5)
 
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """
+    Great-circle distance in miles.
+    """
+    r_miles = 3958.8
+    lat1_r = math.radians(lat1)
+    lon1_r = math.radians(lon1)
+    lat2_r = math.radians(lat2)
+    lon2_r = math.radians(lon2)
+
+    dlat = lat2_r - lat1_r
+    dlon = lon2_r - lon1_r
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlon / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r_miles * c
+
+
+def _geocode_nominatim(address: str) -> tuple[float, float, Optional[str]]:
+    """
+    Geocode address with OpenStreetMap Nominatim.
+    Returns: (lat, lon, postcode)
+    """
     url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": address, "format": "json", "limit": 1}
-    headers = {"User-Agent": "streamlit-california-closeprice-predictor/1.0"}
-
-    resp = requests.get(url, params=params, headers=headers, timeout=15)
+    headers = {"User-Agent": "IDX-Streamlit-App/1.0 (mailto:example@example.com)"}
+    params = {"q": address, "format": "json", "limit": 1, "addressdetails": 1}
+    resp = requests.get(url, params=params, headers=headers, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if not data:
+        raise ValueError("No geocoding results found for that address.")
+
+    item = data[0]
+    lat = float(item["lat"])
+    lon = float(item["lon"])
+
+    postcode = None
+    if "address" in item and isinstance(item["address"], dict):
+        postcode = _normalize_zip(item["address"].get("postcode"))
+    # Fallback: sometimes postcode is embedded in display_name; we skip that.
+    return lat, lon, postcode
+
+
+def _overpass_nearest_restaurant_miles(lat: float, lon: float) -> Optional[float]:
+    """
+    Approximate nearest restaurant distance using OpenStreetMap Overpass.
+    This approximates the notebook's 'zengtao_restaurants' feature.
+    """
+    # Radius in meters (start broad; Overpass may be heavy).
+    radius_m = 8000
+    # Cache-ish: rounding reduces distinct calls.
+    lat_r = round(lat, 4)
+    lon_r = round(lon, 4)
+    try:
+        overpass_url = "https://overpass-api.de/api/interpreter"
+        query = f"""
+        [out:json][timeout:25];
+        (
+          node["amenity"="restaurant"](around:{radius_m},{lat_r},{lon_r});
+          way["amenity"="restaurant"](around:{radius_m},{lat_r},{lon_r});
+          relation["amenity"="restaurant"](around:{radius_m},{lat_r},{lon_r});
+        );
+        out center;
+        """
+        resp = requests.get(overpass_url, params={"data": query}, timeout=45)
+        resp.raise_for_status()
+        data = resp.json()
+        elements = data.get("elements", [])
+        if not elements:
+            return None
+
+        min_dist = None
+        for el in elements:
+            el_lat = None
+            el_lon = None
+            if el.get("type") == "node":
+                el_lat = el.get("lat")
+                el_lon = el.get("lon")
+            else:
+                center = el.get("center") or {}
+                el_lat = center.get("lat")
+                el_lon = center.get("lon")
+
+            if el_lat is None or el_lon is None:
+                continue
+            d = _haversine_miles(lat, lon, float(el_lat), float(el_lon))
+            if min_dist is None or d < min_dist:
+                min_dist = d
+        return min_dist
+    except Exception:
         return None
 
-    best = data[0]
-    lat = float(best["lat"])
-    lon = float(best["lon"])
 
-    postcode_raw = None
-    addr = best.get("address") or {}
-    if isinstance(addr, dict):
-        postcode_raw = addr.get("postcode")
+@st.cache_resource
+def _build_postal_and_district_lookups() -> Optional[Dict[str, Any]]:
+    """
+    Builds:
+    - zip_code_means + rare_zip_mean  (for Postal_Code_Encoded)
+    - district_price_map + rare_district_mean (for District_Avg_Price)
+    - nearest-neighbor index of (lat,lon)->HighSchoolDistrict
+    """
+    csv_files = sorted(glob.glob(os.path.join(BASE_DIR, "CRMLSSold*_filled.csv")))
+    if not csv_files:
+        return None
 
-    postcode_val: float = 0.0
-    if postcode_raw:
-        # Keep digits only (e.g., "90031" -> 90031). Some locations may include dashes.
-        digits = "".join(ch for ch in str(postcode_raw) if ch.isdigit())
-        if digits:
-            # Most US zip codes are 5 digits.
-            postcode_val = float(digits[:5])
+    required_cols = ["PostalCode", "ClosePrice", "HighSchoolDistrict", "latfilled", "lonfilled"]
+    required_lat_fallback = ["Latitude", "Longitude"]
 
-    return {"latitude": lat, "longitude": lon, "postcode": postcode_val}
+    # Read one file to discover available columns.
+    probe = pd.read_csv(csv_files[0], nrows=1)
+    cols = set(probe.columns.tolist())
 
+    lat_col = "latfilled" if "latfilled" in cols else (required_lat_fallback[0] if required_lat_fallback[0] in cols else None)
+    lon_col = "lonfilled" if "lonfilled" in cols else (required_lat_fallback[1] if required_lat_fallback[1] in cols else None)
+    if lat_col is None or lon_col is None:
+        return None
+
+    use_cols = [c for c in required_cols if c in cols] + ["Latitude", "Longitude"]
+    use_cols = [c for c in use_cols if c in cols]
+
+    all_parts = []
+    for f in csv_files:
+        try:
+            df = pd.read_csv(f, usecols=use_cols)
+            all_parts.append(df)
+        except Exception:
+            continue
+
+    if not all_parts:
+        return None
+
+    df_all = pd.concat(all_parts, ignore_index=True)
+    # Drop rows without required geography/labels.
+    df_all = df_all.dropna(subset=[lat_col, lon_col, "PostalCode", "ClosePrice", "HighSchoolDistrict"])
+    if df_all.empty:
+        return None
+
+    df_all["PostalCode_norm"] = df_all["PostalCode"].apply(_normalize_zip)
+    df_all = df_all.dropna(subset=["PostalCode_norm"])
+
+    district_counts = df_all["HighSchoolDistrict"].value_counts()
+    rare_districts = district_counts[district_counts < 3].index
+    rare_district_mean = float(df_all[df_all["HighSchoolDistrict"].isin(rare_districts)]["ClosePrice"].mean())
+
+    district_price_map = df_all.groupby("HighSchoolDistrict")["ClosePrice"].mean().to_dict()
+
+    zip_counts = df_all["PostalCode_norm"].value_counts()
+    rare_zips = zip_counts[zip_counts < 3].index
+    rare_zip_mean = float(df_all[df_all["PostalCode_norm"].isin(rare_zips)]["ClosePrice"].mean())
+
+    zip_code_means = df_all.groupby("PostalCode_norm")["ClosePrice"].mean().to_dict()
+
+    # Nearest neighbor index for district inference.
+    # Use haversine metric -> input must be radians.
+    coords_deg = df_all[[lat_col, lon_col]].astype(float).values
+    coords_rad = np.deg2rad(coords_deg)
+    district_values = df_all["HighSchoolDistrict"].values.astype(str)
+
+    nbrs = NearestNeighbors(n_neighbors=5, metric="haversine", algorithm="ball_tree")
+    nbrs.fit(coords_rad)
+
+    return {
+        "lat_col": lat_col,
+        "lon_col": lon_col,
+        "zip_code_means": zip_code_means,
+        "rare_zip_mean": rare_zip_mean,
+        "district_price_map": district_price_map,
+        "rare_district_mean": rare_district_mean,
+        "district_values": district_values,
+        "nbrs": nbrs,
+    }
+
+
+def _infer_district_price_from_address(lat: float, lon: float, lookups: Dict[str, Any]) -> Optional[float]:
+    nbrs: NearestNeighbors = lookups["nbrs"]
+    district_values = lookups["district_values"]
+
+    query_rad = np.deg2rad(np.array([[lat, lon]], dtype=float))
+    distances, indices = nbrs.kneighbors(query_rad, return_distance=True)
+    # Pick nearest neighbors' districts and take the mode.
+    neighbor_districts = [str(district_values[i]) for i in indices[0].tolist()]
+    if not neighbor_districts:
+        return None
+    chosen_district, _ = Counter(neighbor_districts).most_common(1)[0]
+    district_price_map = lookups["district_price_map"]
+    rare_district_mean = lookups["rare_district_mean"]
+    return float(district_price_map.get(chosen_district, rare_district_mean))
 
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
@@ -84,31 +252,62 @@ def main() -> None:
         st.error("`model.pkl` doesn't contain `feature_columns`. Re-train to generate compatible artifacts.")
         st.stop()
 
-    # Initialize defaults for the address auto-fill feature.
-    st.session_state.setdefault("latitude", 0.0)
-    st.session_state.setdefault("longitude", 0.0)
-    st.session_state.setdefault("postal_code_encoded", 0.0)
-
     st.subheader("🔎 Property details")
     st.caption("Fill these in and we’ll build the exact feature vector your model expects.")
 
-    st.divider()
-    st.subheader("🗺️ Address search (optional)")
-    addr_query = st.text_input("Enter an address (street, city, ZIP) and press Search 🔎", key="addr_query")
-    if st.button("Search address", type="secondary", use_container_width=False):
-        try:
-            result = _geocode_address(addr_query)
-            if not result:
-                st.warning("Could not geocode that address. Try a more specific address (including ZIP).")
-            else:
-                st.session_state["latitude"] = float(result["latitude"])
-                st.session_state["longitude"] = float(result["longitude"])
-                st.session_state["postal_code_encoded"] = float(result["postcode"])
-                st.success(
-                    f"Found it! 📍 Lat {result['latitude']:.5f}, Lon {result['longitude']:.5f}, ZIP {int(result['postcode'])}"
-                )
-        except Exception as e:
-            st.error(f"Geocoding failed: {e}")
+    # ------------------------------
+    # Address auto-fill (web search)
+    # ------------------------------
+    st.markdown("## 🗺️ Address to auto-fill (optional)")
+    st.caption("We’ll geocode your address to get Latitude/Longitude, then approximate ZIP encoding, district value, and nearest restaurant distance.")
+
+    st.session_state.setdefault("address_query", "")
+    st.session_state.setdefault("latitude_input", 0.0)
+    st.session_state.setdefault("longitude_input", 0.0)
+    st.session_state.setdefault("postal_code_encoded_input", 0.0)
+    st.session_state.setdefault("district_avg_price_input", 0.0)
+    st.session_state.setdefault("dist_nearest_restaurant_mi_input", 0.0)
+
+    address = st.text_input("🏠 Enter property address", key="address_query", placeholder="e.g., 3938 Latrobe Street, Los Angeles, CA 90031")
+
+    if st.button("🔎 Search & auto-fill", type="secondary"):
+        if not address.strip():
+            st.warning("Type an address first 🙂")
+        else:
+            lookups = None
+            with st.spinner("Geocoding + deriving features... (may take ~20-60s on first run)"):
+                try:
+                    lat, lon, postcode = _geocode_nominatim(address)
+                    st.session_state["latitude_input"] = lat
+                    st.session_state["longitude_input"] = lon
+
+                    lookups = _build_postal_and_district_lookups()
+                    if lookups is None:
+                        st.info("Could not load local CSV-based lookups for ZIP/district. You can still enter values manually.")
+                    else:
+                        # Postal_Code_Encoded
+                        if "Postal_Code_Encoded" in feature_columns:
+                            zip_norm = _normalize_zip(postcode) if postcode is not None else None
+                            if zip_norm and zip_norm in lookups["zip_code_means"]:
+                                st.session_state["postal_code_encoded_input"] = float(lookups["zip_code_means"][zip_norm])
+                            else:
+                                st.session_state["postal_code_encoded_input"] = float(lookups["rare_zip_mean"])
+
+                        # District_Avg_Price (nearest listing heuristic)
+                        if "District_Avg_Price" in feature_columns:
+                            district_price = _infer_district_price_from_address(lat, lon, lookups)
+                            if district_price is not None:
+                                st.session_state["district_avg_price_input"] = float(district_price)
+
+                    # DistNearestRestaurantMi (approx via live OSM restaurants)
+                    if "DistNearestRestaurantMi" in feature_columns:
+                        approx = _overpass_nearest_restaurant_miles(lat, lon)
+                        if approx is not None:
+                            st.session_state["dist_nearest_restaurant_mi_input"] = float(approx)
+
+                    st.success("Auto-fill complete! You can tweak anything and hit Predict 😄")
+                except Exception as e:
+                    st.error(f"Address lookup failed: {e}")
 
     # Flooring selection drives multiple binary features: HasCarpet/HasVinyl/...
     flooring_map = {
@@ -150,15 +349,15 @@ def main() -> None:
         with c2:
             latitude = st.number_input(
                 "📍 Latitude",
-                value=float(st.session_state.get("latitude", 0.0)),
+                value=float(st.session_state["latitude_input"]),
                 format="%.6f",
-                key="latitude",
+                key="latitude_input",
             )
             longitude = st.number_input(
                 "📍 Longitude",
-                value=float(st.session_state.get("longitude", 0.0)),
+                value=float(st.session_state["longitude_input"]),
                 format="%.6f",
-                key="longitude",
+                key="longitude_input",
             )
             living_area = st.number_input("📐 Living Area (sq ft)", value=0.0, min_value=0.0)
             days_on_market = st.number_input("⏳ Days on Market", value=0.0, min_value=0.0)
@@ -184,13 +383,21 @@ def main() -> None:
             flooring = st.selectbox("Primary flooring", options=list(flooring_map.keys()), index=len(flooring_map) - 1)
 
         st.markdown("### 🧠 Advanced (encoded/derived)")
-        district_avg_price = st.number_input("📊 District average price", value=0.0)
+        district_avg_price = st.number_input(
+            "📊 District average price",
+            value=float(st.session_state["district_avg_price_input"]),
+            key="district_avg_price_input",
+        )
         postal_code_encoded = st.number_input(
             "🏷️ Postal code (encoded)",
-            value=float(st.session_state.get("postal_code_encoded", 0.0)),
-            key="postal_code_encoded",
+            value=float(st.session_state["postal_code_encoded_input"]),
+            key="postal_code_encoded_input",
         )
-        dist_nearest_restaurant_mi = st.number_input("🍽️ Distance to nearest restaurant (mi)", value=0.0)
+        dist_nearest_restaurant_mi = st.number_input(
+            "🍽️ Distance to nearest restaurant (mi)",
+            value=float(st.session_state["dist_nearest_restaurant_mi_input"]),
+            key="dist_nearest_restaurant_mi_input",
+        )
 
         submitted = st.form_submit_button("Predict ClosePrice", type="primary")
 
